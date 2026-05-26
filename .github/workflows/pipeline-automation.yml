@@ -1,0 +1,88 @@
+name: Pipeline Automation
+
+on:
+  schedule:
+    # Tuesday 10:00 AM UTC (Stage 1-2: Collection + Preprocessing)
+    - cron: '0 10 27 5 *'
+    # Thursday 10:00 AM UTC (Stage 3-5: Labeling + Training)
+    - cron: '0 10 29 5 *'
+    # Friday 10:00 AM UTC (Stage 6: Evaluation)
+    - cron: '0 10 30 5 *'
+  workflow_dispatch:
+    inputs:
+      stages:
+        description: 'Stages to run (comma-separated: 1,2,3,4,5,6 or "all")'
+        required: false
+        default: 'all'
+
+permissions:
+  contents: write
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine stages to run
+        id: stages
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            HOUR=$(date -u +%d)
+            case $HOUR in
+              27) echo "stages=1,2" >> $GITHUB_OUTPUT ;;
+              29) echo "stages=3,4,5" >> $GITHUB_OUTPUT ;;
+              30) echo "stages=6" >> $GITHUB_OUTPUT ;;
+              *)  echo "stages=all" >> $GITHUB_OUTPUT ;;
+            esac
+          else
+            echo "stages=${{ github.event.inputs.stages || 'all' }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stage 1 - Collect GitHub Data
+        if: contains(steps.stages.outputs.stages, '1') || steps.stages.outputs.stages == 'all'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: python -m src.github_collector
+
+      - name: Stage 2 - Preprocess and Summarize
+        if: contains(steps.stages.outputs.stages, '2') || steps.stages.outputs.stages == 'all'
+        run: |
+          python -m src.preprocessing
+          python -m src.summarization
+
+      - name: Stage 3 - LLM Weak Labeling
+        if: contains(steps.stages.outputs.stages, '3') || steps.stages.outputs.stages == 'all'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python -m src.llm_labeling
+
+      - name: Stage 4-5 - Split and Train BERT
+        if: contains(steps.stages.outputs.stages, '4') || contains(steps.stages.outputs.stages, '5') || steps.stages.outputs.stages == 'all'
+        run: python -m src.train
+
+      - name: Stage 6 - Evaluate
+        if: contains(steps.stages.outputs.stages, '6') || steps.stages.outputs.stages == 'all'
+        run: |
+          python -m src.evaluation
+          python -m src.visualization
+
+      - name: Commit results
+        run: |
+          git config user.name "Pipeline Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "Pipeline run: stages ${{ steps.stages.outputs.stages }}"
+          git push
